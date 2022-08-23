@@ -1,0 +1,6 @@
+what tf am i making
+
+i want ... 2 things? the end goal is to make my `git logwatch` alias not cut
+off characters early. the reason its doing that is because we're using `cut -c`
+to get the portion of the string to be shown, which does not account for
+non-printing ansi escape sequences. 
