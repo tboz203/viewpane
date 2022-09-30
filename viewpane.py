@@ -31,9 +31,8 @@ logfile = f"{root}/viewpane.log"
 logging.basicConfig(handlers=[logging.NullHandler()])
 logger = logging.getLogger("viewpane")
 
-
-DRAW_RATE = 2
-READ_RATE = 0.05
+DEFAULT_DRAW_RATE = 2
+DEFAULT_READ_RATE = 0.05
 
 
 class StransiInstructionStreamTranslator:
@@ -46,7 +45,7 @@ class StransiInstructionStreamTranslator:
     stream, and what color pairs known to curses.
     """
 
-    def __init__(self, init_attr: int = 0, init_color_num: int = None, color_map: ColorMap = {}):
+    def __init__(self, init_attr: int = 0, init_color_num: int = None, color_map: ColorMap = None):
         """
         initialize a new StransiInstructionStreamTranslator. you can specify a
         starting attr state and/or initial color map here.
@@ -63,14 +62,13 @@ class StransiInstructionStreamTranslator:
         # remove any prior color number from our attr
         self._attr = init_attr & ~(curses.A_COLOR)
 
-        self._color_map = dict(color_map)
+        self._color_map = color_map or {}
 
     def translate_ansi_instruction_stream(self, stream: InstructionStream) -> OutputStream:
         """
         Translate a stransi instruction stream into a sequence of attr/text pairs
-        (with the intention of being fed to `stdstc.addstr(y, x, text, attr)`).
-        Unless specified otherwise, the stream is assumed to start with a blank
-        attribute.
+        (with the intention of being fed to `stdscr.addstr(y, x, text, attr)`).
+        The stream is assumed to start with no attributes set.
         """
         # okay so, we scan through the instruction stream, keeping track of our FG
         # & BG colors, adding in other attributes as they appear, and resetting on
@@ -145,107 +143,150 @@ class StransiInstructionStreamTranslator:
         self._color_num = color_num
 
 
-class Printer:
-    def __init__(self, screen: CursesWindow, color_map: ColorMap = None):
-        self._screen = screen
+class PadManager:
+    """Write Ansi lines into a curses pad, and keep track of its location """
+    def __init__(self, stdscr: CursesWindow, pad: CursesWindow, coords: tuple[int, int] = (0, 0), color_map: ColorMap = None):
+        """
+        Initialize a new PadWriter.
+
+        :param pad: the pad to print into
+        :param coords: the initial (y, x) coordinates of the top left corner of the pad
+        :param color_map: initial ColorMap dictionary passed to StransiInstructionStreamTranslator
+        """
+        self._stdscr = stdscr
+        self._pad = pad
+        self._coords = coords
         self._color_map = color_map or {}
+        self._translator = StransiInstructionStreamTranslator(color_map=self._color_map)
 
-    def print(self, ansi_lines: list[Ansi]) -> None:
+    def write(self, ansi_lines: list[Ansi]) -> None:
         """
-        print a sequence of ansi lines to the curses window, starting at 0, 0.
-        lines are assumed to not have embedded newlines or to wrap across
-        multiple lines.
+        write a sequence of ansi lines to the pad, starting at 0, 0. clears any
+        prior pad contents. lines are assumed to not have embedded newlines.
         """
 
-        translator = StransiInstructionStreamTranslator(color_map=self._color_map)
+        logger.info("writing %s lines into pad", len(ansi_lines))
 
-        height, width = self._screen.getmaxyx()
-        line_nos = range(height - 1)
+        self._resize(ansi_lines)
+        self._pad.clear()
 
-        # like `enumerate(ansi_lines)`, but stop at the edge of the screen
-        for y, line in zip(line_nos, ansi_lines):
+        for y, line in enumerate(ansi_lines):
             # ansi translation magic
             instructions = line.instructions()
             # turn our instructions into text/attr pairs
-            translated_stream = translator.translate_ansi_instruction_stream(instructions)
-            # cut off the x-dimension excess
-            trimmed_stream = trim_stream(translated_stream, width)
+            stream = iter(self._translator.translate_ansi_instruction_stream(instructions))
             # get the first pair and put it explicitly at (y, 0)
-            iterated_stream = iter(trimmed_stream)
-            text, attr = next(iterated_stream)
-            self._screen.addstr(y, 0, text, attr)
+            text, attr = next(stream)
+            self._pad.addstr(y, 0, text, attr)
             # the rest are positioned implicitly
-            for text, attr in iterated_stream:
-                self._screen.addstr(text, attr)
+            for text, attr in stream:
+                self._pad.addstr(text, attr)
+
+    def _resize(self, ansi_lines: list[Ansi]) -> None:
+        """
+        make our pad fit these lines
+        """
+
+        lines_y = len(ansi_lines)
+        lines_x = max(map(ansi_length, ansi_lines))
+
+        self._pad.resize(lines_y, lines_x + 1)
+
+    def move_by(self, move_y: int, move_x: int):
+        """shift the pad, but stay inside the borders"""
+        y, x = self._coords
+        pad_y, pad_x = self._pad.getmaxyx()
+        # only move if the resulting coordinates are still inside the pad
+        if (move_y > 0 and y + move_y < pad_y) or (move_y < 0 and y + move_y >= 0):
+            y += move_y
+        if (move_x > 0 and x + move_x < pad_x) or (move_x < 0 and x + move_x >= 0):
+            x += move_x
+        logger.info("moving pad coordinates to (%s, %s)", y, x)
+        self._coords = (y, x)
+
+    def refresh(self):
+        """display the pad"""
+        logger.info("drawing pad")
+        y, x = self._coords
+        # self._stdscr.clear()
+        self._stdscr.erase()
+        self._stdscr.noutrefresh()
+        self._pad.noutrefresh(y, x, 0, 0, curses.LINES - 1, curses.COLS - 1)
+        self._stdscr.move(curses.LINES-1, 0)
+        self._stdscr.noutrefresh()
+        curses.doupdate()
 
 
-def trim_stream(stream: OutputStream, length: int) -> OutputStream:
-    """
-    given a stream of output text/attr pairs, modify and return the stream such
-    that the resulting text is at most `length` characters long. this function
-    consumes the entire stream, regardless of whether or not the entire stream
-    is included in the output, so that an underlying StransiInstructionStream-
-    -Translator correctly processes all instructions in its input stream
-    """
-    idx = 0
-    for text, attr in stream:
-        if len(text) + idx < length:
-            idx += len(text)
-            yield text, attr
-        else:
-            remainder = length - idx
-            trimmed = text[:remainder]
-            idx += remainder
-            yield trimmed, attr
-            break
+def win_main(stdscr: CursesWindow, command: list[str], draw_rate=None):
 
-    list(stream)
-
-
-def win_main(stdscr: CursesWindow, command: list[str], draw_rate=None, read_rate=None):
-
-    draw_rate = draw_rate or DRAW_RATE
-    read_rate = read_rate or READ_RATE
+    draw_rate = draw_rate or DEFAULT_DRAW_RATE
 
     curses.use_default_colors()
-    stdscr.nodelay(True)
+    curses.halfdelay(1)
 
-    # with open(root.joinpath("bigtext"), "r", encoding="utf-8") as fin:
-    #     text = fin.read()
+    pad = curses.newpad(24, 80)
+    pad.keypad(True)
+    manager = PadManager(stdscr, pad)
 
-    printer = Printer(stdscr)
+    # v_shift = 10
+    # h_shift = 20
+    v_shift = 1
+    h_shift = 10
 
     running = True
 
-    while running:
-        loop_start = time.monotonic()
-
-        curses.update_lines_cols()
-        stdscr.clear()
-
+    def draw():
+        logger.info("calling draw!")
         proc = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         text = proc.stdout.decode("utf-8")
-
         lines = [Ansi(line) for line in text.splitlines()]
 
-        printer.print(lines)
-        max_y, _ = stdscr.getmaxyx()
-        stdscr.move(max_y - 1, 0)
-        stdscr.refresh()
+        manager.write(lines)
+        manager.refresh()
 
-        while True:
-            c = stdscr.getch()
-            if c == ord("q") or c == ord("Q"):
-                # time to goodbye
-                running = False
-                break
+    draw()
 
-            now = time.monotonic()
-            if (now - loop_start) > draw_rate:
-                # time to draw
-                break
+    mark = time.monotonic()
+    while True:
+        now = time.monotonic()
+        if (now - mark) > draw_rate:
+            mark = now
+            draw()
 
-            time.sleep(read_rate)
+        try:
+            c = pad.getkey()
+        except curses.error as exc:
+            if exc.args == ('no input',):
+                # logger.debug("no input")
+                continue
+            else:
+                raise
+
+        if c == 'q':
+            # time to goodbye
+            break
+        elif c == 'KEY_UP':
+            manager.move_by(-v_shift, 0)
+            manager.refresh()
+        elif c == 'KEY_DOWN':
+            manager.move_by(v_shift, 0)
+            manager.refresh()
+        elif c == 'KEY_LEFT':
+            manager.move_by(0, -h_shift)
+            manager.refresh()
+        elif c == 'KEY_RIGHT':
+            manager.move_by(0, h_shift)
+            manager.refresh()
+        elif c == 'KEY_RESIZE':
+            logger.info("refreshing for resize")
+            curses.update_lines_cols()
+            manager.refresh()
+
+
+
+def ansi_length(ansi: Ansi):
+    """get the printing length of an Ansi line"""
+    return sum(len(item) for item in ansi.instructions() if isinstance(item, str))
 
 
 def main():
