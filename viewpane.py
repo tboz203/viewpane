@@ -1,4 +1,4 @@
-#!/usr/local/bin/python3
+#!/home/th026106/.pyenv/versions/viewpane/bin/python
 """
 A quick little program somewhere between `watch` and `less`
 """
@@ -12,43 +12,39 @@ import re
 import subprocess
 import time
 import traceback
+from collections.abc import Iterable
 from enum import Enum
-from pathlib import Path
-from typing import TYPE_CHECKING, Iterable, Literal, Optional, Union
+from typing import TYPE_CHECKING, Any, Literal, NoReturn, TypeVar
 
 from stransi import Ansi
 from stransi.attribute import Attribute, SetAttribute
 from stransi.color import ColorRole, SetColor
-from stransi.instruction import Instruction
 
 if TYPE_CHECKING:
+    from stransi.instruction import Instruction
+
+    Num = TypeVar("Num", int, float)
+
     CursesWindow = curses._CursesWindow
     # that thing what comes outta `Ansi.instructions()`
-    InstructionStream = Iterable[Union[str, Instruction]]
+    InstructionStream = Iterable[str | Instruction]
     # a list of text/attr pairs
     OutputStream = Iterable[tuple[str, int]]
     # a dictionary mapping foreground/background pairs to curses color registry ids
     ColorMap = dict[tuple[int, int], int]
 
-    Num = Union[float, int]
     Boundary = Literal["max", "min"]
-    IntBoundary = Union[int, Boundary]
-    FloatBoundary = Union[float, Boundary]
-    NumBoundary = Union[Num, Boundary]
 
-# root = Path(__file__).parent
-root = Path(".")
-logfile = root.joinpath("viewpane.log")
-logging.root.addHandler(logging.NullHandler())
 logging.basicConfig(
-    filename=logfile.as_posix(),
     format="[%(asctime)s %(levelname)-8s %(name)s] %(message)s",
-    level=logging.DEBUG,
+    # level=logging.DEBUG,
+    level=logging.FATAL,
+    # filename="viewpane.log",
+    handlers=[],
 )
 logger = logging.getLogger("viewpane")
 
 DEFAULT_DRAW_RATE = 2
-DEFAULT_CHECK_RATE = 0.2
 
 
 class StransiInstructionStreamTranslator:
@@ -64,9 +60,9 @@ class StransiInstructionStreamTranslator:
     def __init__(
         self,
         init_attr: int = 0,
-        init_color_num: Optional[int] = None,
-        color_map: Optional[ColorMap] = None,
-    ):
+        init_color_num: int | None = None,
+        color_map: ColorMap | None = None,
+    ) -> None:
         """
         initialize a new StransiInstructionStreamTranslator. you can specify a
         starting attr state and/or initial color map here.
@@ -85,7 +81,9 @@ class StransiInstructionStreamTranslator:
 
         self._color_map = color_map or {}
 
-    def translate_ansi_instruction_stream(self, stream: InstructionStream) -> OutputStream:
+    def translate_ansi_instruction_stream(
+        self, stream: InstructionStream
+    ) -> OutputStream:
         """
         Translate a stransi instruction stream into a sequence of attr/text pairs
         (with the intention of being fed to `stdscr.addstr(y, x, text, attr)`).
@@ -120,7 +118,9 @@ class StransiInstructionStreamTranslator:
                     color_num = self._color_map[(fg, bg)]
                 else:
                     # get the next available color number
-                    color_num = (max(self._color_map.values()) + 1) if self._color_map else 1
+                    color_num = (
+                        (max(self._color_map.values()) + 1) if self._color_map else 1
+                    )
                     # tell curses about it
                     curses.init_pair(color_num, fg, bg)
                     # store the mapping
@@ -173,10 +173,10 @@ class PadManager:
     def __init__(
         self,
         stdscr: CursesWindow,
-        pad: Optional[CursesWindow] = None,
+        pad: CursesWindow | None = None,
         coords: tuple[int, int] = (0, 0),
-        color_map: Optional[ColorMap] = None,
-    ):
+        color_map: ColorMap | None = None,
+    ) -> None:
         """
         Initialize a new PadWriter.
 
@@ -193,13 +193,15 @@ class PadManager:
         self.color_map: ColorMap = color_map or {}
         self.translator = StransiInstructionStreamTranslator(color_map=self.color_map)
 
-    def write(self, ansi_lines: list[Ansi]) -> None:
+    def write(self, ansi_lines: Iterable[Ansi]) -> None:
         """
         write a sequence of ansi lines to the pad, starting at 0, 0. clears any
         prior pad contents. lines are assumed to not have embedded newlines.
         """
 
-        logger.info("writing %s lines into pad", len(ansi_lines))
+        ansi_lines = list(ansi_lines)
+
+        logger.debug("writing %s lines into pad", len(ansi_lines))
 
         self._resize(ansi_lines)
         self.pad.erase()
@@ -208,7 +210,9 @@ class PadManager:
             # ansi translation magic
             instructions = line.instructions()
             # turn our instructions into text/attr pairs
-            stream = iter(self.translator.translate_ansi_instruction_stream(instructions))
+            stream = iter(
+                self.translator.translate_ansi_instruction_stream(instructions)
+            )
             # get the first pair and put it explicitly at (y, 0)
             try:
                 text, attr = next(stream)
@@ -219,8 +223,6 @@ class PadManager:
             for text, attr in stream:
                 self.pad.addstr(text, attr)
 
-        logger.debug("lines written")
-
     def _resize(self, ansi_lines: list[Ansi]) -> None:
         """make our pad fit these lines"""
         lines_y = len(ansi_lines) or 1
@@ -229,17 +231,19 @@ class PadManager:
         logger.debug("resizing pad to %s, %s", lines_y, lines_x)
         self.pad.resize(lines_y, lines_x + 1)
 
-    def move_by(self, move_y: int, move_x: int):
+    def move_by(self, move_y: int, move_x: int) -> None:
         """shift the pad, but stay inside the borders"""
         y, x = self.coords
         max_y, max_x = self.pad.getmaxyx()
         # move, but stay inside our pad
         y = int(bound(0, y + move_y, max_y - 1))
         x = int(bound(0, x + move_x, max_x - 1))
-        logger.debug("moving pad coordinates to (%s, %s)", y, x)
+        logger.debug("moving pad (%+d, %+d) to (%d, %d)", move_y, move_x, y, x)
         self.coords = (y, x)
 
-    def jump_to(self, new_y: Optional[IntBoundary], new_x: Optional[IntBoundary]) -> None:
+    def jump_to(
+        self, new_y: int | Boundary | None, new_x: int | Boundary | None
+    ) -> None:
         """jump to specific coordinates, or a specific edge"""
         old_y, old_x = self.coords
         max_y, max_x = self.pad.getmaxyx()
@@ -250,11 +254,12 @@ class PadManager:
         y = int(bound(0, new_y, max_y - 1))
         x = int(bound(0, new_x, max_x - 1))
 
+        logger.debug("setting pad coordinates to (%s, %s)", y, x)
         self.coords = (y, x)
 
-    def refresh(self):
+    def refresh(self) -> None:
         """display the pad"""
-        logger.info("refreshing the pad")
+        logger.debug("refreshing the pad")
         y, x = self.coords
         self.stdscr.erase()
         self.stdscr.noutrefresh()
@@ -322,6 +327,8 @@ class Viewpane:
         # VIM page movement
         "u": Action.HALF_PAGE_UP,
         "d": Action.HALF_PAGE_DOWN,
+        "b": Action.PAGE_UP,
+        "f": Action.PAGE_DOWN,
         "H": Action.PAGE_LEFT,
         "J": Action.PAGE_DOWN,
         "K": Action.PAGE_UP,
@@ -336,9 +343,10 @@ class Viewpane:
     def __init__(
         self,
         window: CursesWindow,
-        command: Union[str, list[str]],
-        draw_rate: Optional[Num] = None,
-        check_rate: Optional[Num] = None,
+        command: str | list[str],
+        draw_rate: int | float | None = None,
+        *,
+        info: bool = False,
     ) -> None:
         self.window = window
 
@@ -347,48 +355,66 @@ class Viewpane:
             command = quote_str_list(command)
 
         self.command = command
-
         self.draw_rate = draw_rate or DEFAULT_DRAW_RATE
-        self.check_rate = check_rate or DEFAULT_CHECK_RATE
+        self.info = info
 
         logger.debug("draw rate is %s", draw_rate)
-        logger.debug("check rate is %s", check_rate)
 
         curses.use_default_colors()
-        curses.halfdelay(int(self.check_rate * 10))
+        curses.halfdelay(1)
 
         self.manager = PadManager(self.window)
 
-    def run(self):
-        self.draw()
+    def run(self) -> None:
+        try:
+            self.draw()
+            mark = time.monotonic()
+            while True:
+                # logger.debug("top of tight loop")
+                now = time.monotonic()
+                # if enough time has elapsed, redraw
+                if (now - mark) > self.draw_rate:
+                    mark = now
+                    # blocks for subprocess
+                    self.draw()
 
-        mark = time.monotonic()
-        while True:
-            # logger.debug("top of tight loop")
-            now = time.monotonic()
-            # if enough time has elapsed, redraw
-            if (now - mark) > self.draw_rate:
-                mark = now
-                self.draw()
-
-            # check for keypress
-            action = self.read_and_interpret_keypress()
-            if action == "quit":
-                break
+                # check for keypress (blocks on
+                action = self.read_and_interpret_keypress()
+                if action == "quit":
+                    break
+        except KeyboardInterrupt:
+            pass
 
     def draw(self) -> None:
         """Execute the given command, write it into the PadManager, and refresh it."""
 
-        logger.debug("calling command (%s)!", self.command)
-        status, text = subprocess.getstatusoutput(self.command)
-        if status:
-            raise RuntimeError("command failed", self.command, text)
-        lines = [Ansi(line) for line in text.splitlines()]
-
-        self.manager.write(lines)
+        result = self.execute()
+        ansi_lines = self.make_lines(result)
+        self.manager.write(ansi_lines)
         self.manager.refresh()
 
-    def read_and_interpret_keypress(self) -> Optional[str]:
+    def execute(self) -> subprocess.CompletedProcess:
+        logger.debug("calling command (%s)!", self.command)
+        result = subprocess.run(
+            self.command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+        )
+        logger.debug("command return code: %d", result.returncode)
+        return result
+
+    def make_lines(self, result: subprocess.CompletedProcess) -> Iterable[Ansi]:
+        if self.info:
+            info = f"{result.returncode}: {self.command}"
+            if result.returncode == 0:
+                info_colors = "30;43"  # black text on yellow
+            else:
+                info_colors = "1;37;41"  # bold white text on red
+
+            yield Ansi(f"\x1b[{info_colors}m{info}\x1b[0m")
+
+        for line in result.stdout.decode().splitlines():
+            yield Ansi(line)
+
+    def read_and_interpret_keypress(self) -> str | None:
         if not (maybe_key := self.check_keypress()):
             return
 
@@ -398,8 +424,13 @@ class Viewpane:
         if result := self.perform_action(action):
             return result
 
-    def check_keypress(self) -> Optional[str]:
-        """check for a keypress without blocking"""
+    def check_keypress(self) -> str | None:
+        """
+        Check for a keypress.
+
+        Blocks for up to 1/10th of a second (assuming nobody has taken us out of
+        half-delay mode).
+        """
         try:
             return self.manager.pad.getkey()
         except curses.error as exc:
@@ -408,11 +439,11 @@ class Viewpane:
             else:
                 raise
 
-    def interpret_keypress(self, key: str) -> Optional[Action]:
+    def interpret_keypress(self, key: str) -> Action | None:
         """Determine the appropriate action for a given keypress."""
         return self.KEYMAP.get(key)
 
-    def perform_action(self, action: Action) -> Optional[str]:
+    def perform_action(self, action: Action) -> str | None:
         """
         Perform an action. If furthur handling is required, returns an
         appropriate string. Otherwise returns None.
@@ -466,7 +497,7 @@ class Viewpane:
         self.manager.refresh()
 
 
-def ansi_length(ansi: Ansi):
+def ansi_length(ansi: Ansi) -> int:
     """get the printing length of an Ansi line"""
     return sum(len(item) for item in ansi.instructions() if isinstance(item, str))
 
@@ -485,7 +516,7 @@ def quote_str_list(values: list[str]) -> str:
     return " ".join(output)
 
 
-def bound(lower: Num, value: NumBoundary, upper: Num) -> Num:
+def bound(lower: Num, value: Num | Boundary, upper: Num) -> Num:
     """
     Return `value` (which may be either a number or the literals
     'max' or 'min'), bounded within `lower` and `upper`, inclusive.
@@ -499,40 +530,68 @@ def bound(lower: Num, value: NumBoundary, upper: Num) -> Num:
     raise ValueError("Invalid value", value)
 
 
-def main():
+def main() -> NoReturn:
     """Program Main: parse args, start curses, and handle exceptions."""
-    logger.info("starting")
-
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("-d", "--delay", type=float, help="How frequently to run the watched command")
+    parser.add_argument(
+        "-d",
+        "--delay",
+        type=float,
+        help="How frequently to run the watched command",
+    )
+    parser.add_argument(
+        "-i",
+        "--info",
+        action="store_true",
+        help="Include an informational line at the top of the output",
+    )
 
     parser.add_argument("command", nargs="*", help="the command to watch")
-    parser.add_argument("-c", "--command", dest="command_str", help="the command to watch (as a quoted string)")
+    parser.add_argument(
+        "-c",
+        "--command",
+        dest="command_str",
+        help="the command to watch (as a quoted string)",
+    )
 
     args = parser.parse_args()
 
+    logger.info("starting: %s", args)
+
     # we require command XOR command_str
+    # can't use mutually_exclusive_group; only works for options :/
     if bool(args.command) == bool(args.command_str):
         parser.error("Must pass `command` or `--command`, but not both")
 
+    exit_value: Any = 0
     try:
-        curses.wrapper(win_main, args.command or args.command_str, draw_rate=args.delay)
+        curses.wrapper(
+            win_main,
+            args.command or args.command_str,
+            draw_rate=args.delay,
+            info=args.info,
+        )
     except KeyboardInterrupt:
         pass
+    except subprocess.CalledProcessError as exc:
+        logger.fatal("Halting for Exception: %s", exc, exc_info=exc)
+        exit_value = exc
     except Exception as exc:
         logger.exception("caught fatal error: %s", exc)
         traceback.print_exc()
     finally:
-        logger.info("stopping")
+        logger.info("viewpane return code: %s", exit_value)
+        exit(exit_value)
 
 
 def win_main(
     stdscr: CursesWindow,
-    command: Union[str, list[str]],
-    draw_rate: Union[int, float, None] = None,
-    check_rate: Union[int, float, None] = None,
+    command: str | list[str],
+    draw_rate: int | float | None = None,
+    *,
+    info: bool = False,
 ) -> None:
-    viewpane = Viewpane(stdscr, command, draw_rate, check_rate)
+    viewpane = Viewpane(stdscr, command, draw_rate, info=info)
     viewpane.run()
 
 
