@@ -1,4 +1,4 @@
-#!/home/th026106/.pyenv/versions/viewpane/bin/python
+#!/usr/bin/env uv-run-in-project
 """
 A quick little program somewhere between `watch` and `less`
 """
